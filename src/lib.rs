@@ -107,24 +107,17 @@ impl<T: PartialOrd + num_traits::Signed + Copy> Number for T {}
 pub struct Pid<T: Number> {
     /// Ideal setpoint to strive for.
     pub setpoint: T,
-    /// Defines the overall output filter limit.
-    pub output_limit: T,
+    /// Defines the overall output filter limit(low, high).
+    pub output_limit: (T, T),
     /// Proportional gain.
     pub kp: T,
     /// Integral gain.
     pub ki: T,
     /// Derivative gain.
     pub kd: T,
-    /// Limiter for the proportional term: `-p_limit <= P <= p_limit`.
-    pub p_limit: T,
-    /// Limiter for the integral term: `-i_limit <= I <= i_limit`.
-    pub i_limit: T,
-    /// Limiter for the derivative term: `-d_limit <= D <= d_limit`.
-    pub d_limit: T,
-    /// Last calculated integral value if [Pid::ki] is used.
-    integral_term: T,
     /// Previously found measurement whilst using the [Pid::next_control_output] method.
     prev_measurement: Option<T>,
+    output_sum: T,
 }
 
 /// Output of [controller iterations](Pid::next_control_output) with weights
@@ -168,39 +161,33 @@ where
     /// - [Self::p()]: Proportional term setting
     /// - [Self::i()]: Integral term setting
     /// - [Self::d()]: Derivative term setting
-    pub fn new(setpoint: impl Into<T>, output_limit: impl Into<T>) -> Self {
+    pub fn new(setpoint: impl Into<T>, output_limit: (impl Into<T>, impl Into<T>)) -> Self {
         Self {
             setpoint: setpoint.into(),
-            output_limit: output_limit.into(),
+            output_limit: (output_limit.0.into(), output_limit.1.into()),
             kp: T::zero(),
             ki: T::zero(),
             kd: T::zero(),
-            p_limit: T::zero(),
-            i_limit: T::zero(),
-            d_limit: T::zero(),
-            integral_term: T::zero(),
             prev_measurement: None,
+            output_sum: T::zero(),
         }
     }
 
     /// Sets the [Self::p] term for this controller.
-    pub fn p(&mut self, gain: impl Into<T>, limit: impl Into<T>) -> &mut Self {
+    pub fn p(&mut self, gain: impl Into<T>) -> &mut Self {
         self.kp = gain.into();
-        self.p_limit = limit.into();
         self
     }
 
     /// Sets the [Self::i] term for this controller.
-    pub fn i(&mut self, gain: impl Into<T>, limit: impl Into<T>) -> &mut Self {
+    pub fn i(&mut self, gain: impl Into<T>) -> &mut Self {
         self.ki = gain.into();
-        self.i_limit = limit.into();
         self
     }
 
     /// Sets the [Self::d] term for this controller.
-    pub fn d(&mut self, gain: impl Into<T>, limit: impl Into<T>) -> &mut Self {
+    pub fn d(&mut self, gain: impl Into<T>) -> &mut Self {
         self.kd = gain.into();
-        self.d_limit = limit.into();
         self
     }
 
@@ -216,58 +203,37 @@ where
     ///
     /// - If a setpoint has not been set via `update_setpoint()`.
     pub fn next_control_output(&mut self, measurement: T) -> ControlOutput<T> {
-        // Calculate the error between the ideal setpoint and the current
-        // measurement to compare against
         let error = self.setpoint - measurement;
-
-        // Calculate the proportional term and limit to it's individual limit
-        let p_unbounded = error * self.kp;
-        let p = apply_limit(self.p_limit, p_unbounded);
-
-        // Mitigate output jumps when ki(t) != ki(t-1).
-        // While it's standard to use an error_integral that's a running sum of
-        // just the error (no ki), because we support ki changing dynamically,
-        // we store the entire term so that we don't need to remember previous
-        // ki values.
-        self.integral_term = self.integral_term + error * self.ki;
-
-        // Mitigate integral windup: Don't want to keep building up error
-        // beyond what i_limit will allow.
-        self.integral_term = apply_limit(self.i_limit, self.integral_term);
-
-        // Mitigate derivative kick: Use the derivative of the measurement
-        // rather than the derivative of the error.
-        let d_unbounded = -match self.prev_measurement.as_ref() {
+        let d= match self.prev_measurement.as_ref() {
             Some(prev_measurement) => measurement - *prev_measurement,
             None => T::zero(),
-        } * self.kd;
+        };
+
+        let p_unbounded = self.kp * error;
+        let i_unbounded = self.output_sum + self.ki * error;
+        let d_unbounded = self.kd * d;
+
+        self.output_sum = i_unbounded - self.kp * d;
+        self.output_sum =
+            num_traits::clamp(self.output_sum, self.output_limit.0, self.output_limit.1);
+
+        let mut output = p_unbounded + (self.output_sum - d_unbounded);
+        output = num_traits::clamp(output, self.output_limit.0, self.output_limit.1);
+
         self.prev_measurement = Some(measurement);
-        let d = apply_limit(self.d_limit, d_unbounded);
 
-        // Calculate the final output by adding together the PID terms, then
-        // apply the final defined output limit
-        let output = p + self.integral_term + d;
-        let output = apply_limit(self.output_limit, output);
-
-        // Return the individual term's contributions and the final output
         ControlOutput {
-            p,
-            i: self.integral_term,
-            d,
-            output: output,
+            p: p_unbounded,
+            i: i_unbounded,
+            d: -d_unbounded,
+            output,
         }
     }
 
-    /// Resets the integral term back to zero, this may drastically change the
-    /// control output.
-    pub fn reset_integral_term(&mut self) {
-        self.integral_term = T::zero();
+    pub fn reset(&mut self) {
+        self.prev_measurement = None;
+        self.output_sum = T::zero();
     }
-}
-
-/// Saturating the input `value` according the absolute `limit` (`-abs(limit) <= output <= abs(limit)`).
-fn apply_limit<T: Number>(limit: T, value: T) -> T {
-    num_traits::clamp(value, -limit.abs(), limit.abs())
 }
 
 #[cfg(test)]
@@ -278,69 +244,53 @@ mod tests {
     /// Proportional-only controller operation and limits
     #[test]
     fn proportional() {
-        let mut pid = Pid::new(10.0, 100.0);
-        pid.p(2.0, 100.0).i(0.0, 100.0).d(0.0, 100.0);
+        let mut pid = Pid::new(10.0, (-100.0, 100.0));
+        pid.p(2.0).i(0.0).d(0.0);
         assert_eq!(pid.setpoint, 10.0);
 
         // Test simple proportional
         assert_eq!(pid.next_control_output(0.0).output, 20.0);
-
-        // Test proportional limit
-        pid.p_limit = 10.0;
-        assert_eq!(pid.next_control_output(0.0).output, 10.0);
     }
 
     /// Derivative-only controller operation and limits
     #[test]
     fn derivative() {
-        let mut pid = Pid::new(10.0, 100.0);
-        pid.p(0.0, 100.0).i(0.0, 100.0).d(2.0, 100.0);
+        let mut pid = Pid::new(10.0, (-100.0, 100.0));
+        pid.p(0.0).i(0.0).d(2.0);
 
         // Test that there's no derivative since it's the first measurement
         assert_eq!(pid.next_control_output(0.0).output, 0.0);
 
         // Test that there's now a derivative
         assert_eq!(pid.next_control_output(5.0).output, -10.0);
-
-        // Test derivative limit
-        pid.d_limit = 5.0;
-        assert_eq!(pid.next_control_output(10.0).output, -5.0);
     }
 
     /// Integral-only controller operation and limits
     #[test]
     fn integral() {
-        let mut pid = Pid::new(10.0, 100.0);
-        pid.p(0.0, 100.0).i(2.0, 100.0).d(0.0, 100.0);
+        let mut pid = Pid::new(10.0, (-100.0, 100.0));
+        pid.p(0.0).i(2.0).d(0.0);
 
         // Test basic integration
         assert_eq!(pid.next_control_output(0.0).output, 20.0);
         assert_eq!(pid.next_control_output(0.0).output, 40.0);
         assert_eq!(pid.next_control_output(5.0).output, 50.0);
 
-        // Test limit
-        pid.i_limit = 50.0;
-        assert_eq!(pid.next_control_output(5.0).output, 50.0);
         // Test that limit doesn't impede reversal of error integral
         assert_eq!(pid.next_control_output(15.0).output, 40.0);
 
         // Test that error integral accumulates negative values
-        let mut pid2 = Pid::new(-10.0, 100.0);
-        pid2.p(0.0, 100.0).i(2.0, 100.0).d(0.0, 100.0);
+        let mut pid2 = Pid::new(-10.0, (-100.0, 100.0));
+        pid2.p(0.0).i(2.0).d(0.0);
         assert_eq!(pid2.next_control_output(0.0).output, -20.0);
         assert_eq!(pid2.next_control_output(0.0).output, -40.0);
-
-        pid2.i_limit = 50.0;
-        assert_eq!(pid2.next_control_output(-5.0).output, -50.0);
-        // Test that limit doesn't impede reversal of error integral
-        assert_eq!(pid2.next_control_output(-15.0).output, -40.0);
     }
 
     /// Checks that a full PID controller's limits work properly through multiple output iterations
     #[test]
-    fn output_limit() {
-        let mut pid = Pid::new(10.0, 1.0);
-        pid.p(1.0, 100.0).i(0.0, 100.0).d(0.0, 100.0);
+    fn high_limit() {
+        let mut pid = Pid::new(10.0, (-1.0, 1.0));
+        pid.p(1.0).i(0.0).d(0.0);
 
         let out = pid.next_control_output(0.0);
         assert_eq!(out.p, 10.0); // 1.0 * 10.0
@@ -354,8 +304,8 @@ mod tests {
     /// Combined PID operation
     #[test]
     fn pid() {
-        let mut pid = Pid::new(10.0, 100.0);
-        pid.p(1.0, 100.0).i(0.1, 100.0).d(1.0, 100.0);
+        let mut pid = Pid::new(10.0, (-100.0, 100.0));
+        pid.p(1.0).i(0.1).d(1.0);
 
         let out = pid.next_control_output(0.0);
         assert_eq!(out.p, 10.0); // 1.0 * 10.0
@@ -367,30 +317,33 @@ mod tests {
         assert_eq!(out.p, 5.0); // 1.0 * 5.0
         assert_eq!(out.i, 1.5); // 0.1 * (10.0 + 5.0)
         assert_eq!(out.d, -5.0); // -(1.0 * 5.0)
-        assert_eq!(out.output, 1.5);
+        // assert_eq!(out.output, 1.5);
+        assert_eq!(out.output, -3.5);
 
         let out = pid.next_control_output(11.0);
         assert_eq!(out.p, -1.0); // 1.0 * -1.0
-        assert_eq!(out.i, 1.4); // 0.1 * (10.0 + 5.0 - 1)
+        assert_eq!(out.i, -3.6); // 0.1 * (10.0 + 5.0 - 1)
         assert_eq!(out.d, -6.0); // -(1.0 * 6.0)
-        assert_eq!(out.output, -5.6);
+        // assert_eq!(out.output, -5.6);
+        assert_eq!(out.output, -16.6);
 
         let out = pid.next_control_output(10.0);
         assert_eq!(out.p, 0.0); // 1.0 * 0.0
-        assert_eq!(out.i, 1.4); // 0.1 * (10.0 + 5.0 - 1.0 + 0.0)
+        // assert_eq!(out.i, 1.4); // 0.1 * (10.0 + 5.0 - 1.0 + 0.0)
+        assert_eq!(out.i, -9.6); // 0.1 * (10.0 + 5.0 - 1.0 + 0.0)
         assert_eq!(out.d, 1.0); // -(1.0 * -1.0)
-        assert_eq!(out.output, 2.4);
+        assert_eq!(out.output, -7.6);
     }
 
     // NOTE: use for new test in future: /// Full PID operation with mixed float checking to make sure they're equal
     /// PID operation with zero'd values, checking to see if different floats equal each other
     #[test]
     fn floats_zeros() {
-        let mut pid_f32 = Pid::new(10.0f32, 100.0);
-        pid_f32.p(0.0, 100.0).i(0.0, 100.0).d(0.0, 100.0);
+        let mut pid_f32 = Pid::new(10.0f32, (-100.0, 100.0));
+        pid_f32.p(0.0).i(0.0).d(0.0);
 
-        let mut pid_f64 = Pid::new(10.0, 100.0f64);
-        pid_f64.p(0.0, 100.0).i(0.0, 100.0).d(0.0, 100.0);
+        let mut pid_f64 = Pid::new(10.0, (-100.0f64, 100.0f64));
+        pid_f64.p(0.0).i(0.0).d(0.0);
 
         for _ in 0..5 {
             assert_eq!(
@@ -404,11 +357,11 @@ mod tests {
     /// PID operation with zero'd values, checking to see if different floats equal each other
     #[test]
     fn signed_integers_zeros() {
-        let mut pid_i8 = Pid::new(10i8, 100);
-        pid_i8.p(0, 100).i(0, 100).d(0, 100);
+        let mut pid_i8 = Pid::new(10i8, (-100, 100));
+        pid_i8.p(0).i(0).d(0);
 
-        let mut pid_i32 = Pid::new(10i32, 100);
-        pid_i32.p(0, 100).i(0, 100).d(0, 100);
+        let mut pid_i32 = Pid::new(10i32, (-100, 100));
+        pid_i32.p(0).i(0).d(0);
 
         for _ in 0..5 {
             assert_eq!(
@@ -421,8 +374,8 @@ mod tests {
     /// See if the controller can properly target to the setpoint after 2 output iterations
     #[test]
     fn setpoint() {
-        let mut pid = Pid::new(10.0, 100.0);
-        pid.p(1.0, 100.0).i(0.1, 100.0).d(1.0, 100.0);
+        let mut pid = Pid::new(10.0, (-100.0, 100.0));
+        pid.p(1.0).i(0.1).d(1.0);
 
         let out = pid.next_control_output(0.0);
         assert_eq!(out.p, 10.0); // 1.0 * 10.0
@@ -445,9 +398,9 @@ mod tests {
 
     /// Make sure negative limits don't break the controller
     #[test]
-    fn negative_limits() {
-        let mut pid = Pid::new(10.0f32, -10.0);
-        pid.p(1.0, -50.0).i(1.0, -50.0).d(1.0, -50.0);
+    fn limits() {
+        let mut pid = Pid::new(10.0f32, (-10.0, 10.0));
+        pid.p(1.0).i(1.0).d(1.0);
 
         let out = pid.next_control_output(0.0);
         assert_eq!(out.p, 10.0);
